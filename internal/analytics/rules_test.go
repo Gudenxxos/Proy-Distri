@@ -7,10 +7,16 @@ import (
 	"proy-distri/internal/model"
 )
 
+// TestEvaluateCongestion valida que una condicion de congestion emita comando.
 func TestEvaluateCongestion(t *testing.T) {
 	e := NewEvaluator(config.CityConfig{
 		BaseGreenSeconds:           15,
 		CongestionExtensionSeconds: 10,
+		SensorProfiles: []config.SensorProfile{{
+			SensorID:     "CAM-B3",
+			SensorType:   "camara",
+			Intersection: "INT_B3",
+		}},
 	})
 
 	status, cmd := e.Evaluate(model.IntersectionSnapshot{
@@ -29,6 +35,35 @@ func TestEvaluateCongestion(t *testing.T) {
 	}
 }
 
+// TestEvaluateIgnoresInductiveOnlyIntersection validates that inductive-only nodes do not trigger congestion.
+func TestEvaluateIgnoresInductiveOnlyIntersection(t *testing.T) {
+	e := NewEvaluator(config.CityConfig{
+		BaseGreenSeconds:           15,
+		CongestionExtensionSeconds: 10,
+		SensorProfiles: []config.SensorProfile{{
+			SensorID:     "ESP-D3",
+			SensorType:   "espira_inductiva",
+			Intersection: "INT_D3",
+		}},
+	})
+
+	status, cmd := e.Evaluate(model.IntersectionSnapshot{
+		Intersection: "INT_D3",
+		QueueLength:  10,
+		AvgSpeed:     0,
+		Density:      40,
+		HasSemaphore: true,
+	})
+
+	if status != StatusNormal {
+		t.Fatalf("expected normal for inductive-only intersection, got %s", status)
+	}
+	if cmd != nil {
+		t.Fatalf("expected no command for inductive-only intersection, got %+v", cmd)
+	}
+}
+
+// TestBuildPriorityWave valida la seleccion de semaforos por ruta priorizada.
 func TestBuildPriorityWave(t *testing.T) {
 	city := &model.City{Intersections: map[string]*model.IntersectionState{
 		"INT_B2": {ID: "INT_B2", HasSemaphore: true},
@@ -47,6 +82,7 @@ func TestBuildPriorityWave(t *testing.T) {
 	}
 }
 
+// TestBuildForceGreen valida la construccion de un comando manual force_green.
 func TestBuildForceGreen(t *testing.T) {
 	e := NewEvaluator(config.CityConfig{
 		Intersections: []config.IntersectionConfig{

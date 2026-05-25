@@ -17,6 +17,7 @@ import (
 	"proy-distri/internal/storage"
 )
 
+// main arranca el servicio de semaforos y procesa comandos entrantes.
 func main() {
 	cfgPath := getenv("CITY_CONFIG", "configs/city.json")
 	cfg, err := config.Load(cfgPath)
@@ -49,6 +50,7 @@ func main() {
 		cfg:             cfg,
 		states:          make(map[string]string),
 		timers:          make(map[string]*intersectionTimer),
+		forceLocks:      make(map[string]time.Time),
 		pushExecuted:    pushExecuted,
 		pushVisualizer:  pushVisualizer,
 	}
@@ -83,22 +85,27 @@ func main() {
 	}
 }
 
+// intersectionTimer controla reinicios y parada del temporizador por interseccion.
 type intersectionTimer struct {
 	resetCh chan int
 	stopCh  chan struct{}
 }
 
+// trafficLightApp mantiene estado, temporizadores y canales de salida.
 type trafficLightApp struct {
 	cfg            config.CityConfig
 	states         map[string]string
 	stateMu        sync.RWMutex
 	timers         map[string]*intersectionTimer
 	timerMu        sync.Mutex
+	forceLocks     map[string]time.Time
+	forceLockMu    sync.Mutex
 	sendMu         sync.Mutex
 	pushExecuted   zmq4.Socket
 	pushVisualizer zmq4.Socket
 }
 
+// processCommand valida y aplica un comando de cambio de fase, emitiendo resultados.
 func (app *trafficLightApp) processCommand(cmd model.LightCommand) {
 	intersection := normalizeIntersectionID(cmd.Intersection)
 	if !app.hasSemaphore(intersection) {
@@ -118,6 +125,11 @@ func (app *trafficLightApp) processCommand(cmd model.LightCommand) {
 	}
 
 	now := storage.NowStoreTime()
+	if lockedUntil, locked := app.activeForceLock(intersection, now); locked {
+		log.Printf("[traffic-light] ignorando comando en %s: bloqueo force activo hasta %s", intersection, lockedUntil.Format(time.RFC3339))
+		return
+	}
+
 	previous, err := app.setLightState(intersection, phase)
 	if err != nil {
 		log.Printf("[traffic-light] no se pudo aplicar comando en %s: %v", intersection, err)
@@ -138,15 +150,48 @@ func (app *trafficLightApp) processCommand(cmd model.LightCommand) {
 	if executed.RequestedBy == "" {
 		executed.RequestedBy = "analytics"
 	}
-	/* if executed.Reason == "" {
-		executed.Reason = "manual_command"
-	} */
+
+	if isForceProtectedReason(executed.Reason) {
+		app.setForceLock(intersection, now.Add(time.Duration(duration)*time.Second))
+	}
 
 	app.emitLightCommand(executed)
 	log.Printf("[traffic-light] %s %s -> %s por %ds (reason=%s)", intersection, previous, phase, duration, executed.Reason)
 	app.resetTimer(intersection, duration)
 }
 
+// activeForceLock devuelve el fin del bloqueo force si sigue vigente.
+func (app *trafficLightApp) activeForceLock(intersection string, now time.Time) (time.Time, bool) {
+	app.forceLockMu.Lock()
+	defer app.forceLockMu.Unlock()
+
+	until, ok := app.forceLocks[intersection]
+	if !ok {
+		return time.Time{}, false
+	}
+
+	if !now.Before(until) {
+		delete(app.forceLocks, intersection)
+		return time.Time{}, false
+	}
+
+	return until, true
+}
+
+// setForceLock fija el periodo en el que no se aceptan nuevos cambios.
+func (app *trafficLightApp) setForceLock(intersection string, until time.Time) {
+	app.forceLockMu.Lock()
+	defer app.forceLockMu.Unlock()
+	app.forceLocks[intersection] = until
+}
+
+// isForceProtectedReason identifica comandos que activan bloqueo temporal.
+func isForceProtectedReason(reason string) bool {
+	reason = strings.ToLower(strings.TrimSpace(reason))
+	return reason == "force_green" || reason == "ola_verde"
+}
+
+// resetTimer rearma la duracion activa para una interseccion.
 func (app *trafficLightApp) resetTimer(intersection string, durationSec int) {
 	if durationSec <= 0 {
 		durationSec = app.cfg.BaseGreenSeconds
@@ -164,6 +209,7 @@ func (app *trafficLightApp) resetTimer(intersection string, durationSec int) {
 	}
 }
 
+// ensureTimer crea o recupera el timer dedicado de una interseccion.
 func (app *trafficLightApp) ensureTimer(intersection string) *intersectionTimer {
 	app.timerMu.Lock()
 	defer app.timerMu.Unlock()
@@ -181,6 +227,7 @@ func (app *trafficLightApp) ensureTimer(intersection string) *intersectionTimer 
 	return timer
 }
 
+// runTimerLoop ejecuta el ciclo automatico de alternancia por interseccion.
 func (app *trafficLightApp) runTimerLoop(intersection string, timer *intersectionTimer) {
 	var activeTimer *time.Timer
 	defer func() {
@@ -241,6 +288,7 @@ func (app *trafficLightApp) runTimerLoop(intersection string, timer *intersectio
 	}
 }
 
+// emitLightCommand publica el comando ejecutado a analytics y visualizer.
 func (app *trafficLightApp) emitLightCommand(cmd model.LightCommand) {
 	data, _ := json.Marshal(cmd)
 
@@ -255,6 +303,7 @@ func (app *trafficLightApp) emitLightCommand(cmd model.LightCommand) {
 	}
 }
 
+// setLightState fija una fase concreta en memoria para una interseccion.
 func (app *trafficLightApp) setLightState(intersection, phase string) (string, error) {
 	phase = strings.ToUpper(strings.TrimSpace(phase))
 	if phase != model.LightPhaseVertical && phase != model.LightPhaseHorizontal {
@@ -272,6 +321,7 @@ func (app *trafficLightApp) setLightState(intersection, phase string) (string, e
 	return previous, nil
 }
 
+// flipLightState cambia a la fase opuesta cuando termina un ciclo.
 func (app *trafficLightApp) flipLightState(intersection string) (string, string, bool) {
 	if !app.hasSemaphore(intersection) {
 		return "", "", false
@@ -290,6 +340,7 @@ func (app *trafficLightApp) flipLightState(intersection string) (string, string,
 	return previous, next, true
 }
 
+// hasSemaphore valida si una interseccion admite cambios de luz.
 func (app *trafficLightApp) hasSemaphore(intersection string) bool {
 	intersection = normalizeIntersectionID(intersection)
 	for _, item := range app.cfg.Intersections {
@@ -300,14 +351,17 @@ func (app *trafficLightApp) hasSemaphore(intersection string) bool {
 	return false
 }
 
+// normalizeIntersectionID normaliza IDs para comparaciones internas.
 func normalizeIntersectionID(intersection string) string {
 	return strings.ToUpper(strings.TrimSpace(intersection))
 }
 
+// commandID genera IDs trazables para comandos emitidos.
 func commandID(prefix, intersection string, now time.Time) string {
 	return fmt.Sprintf("%s-%s-%s", prefix, normalizeIntersectionID(intersection), now.Format("20060102150405.000000000"))
 }
 
+// getenv lee una variable de entorno con fallback.
 func getenv(key, fallback string) string {
 	value := os.Getenv(key)
 	if value == "" {

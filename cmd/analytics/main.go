@@ -19,6 +19,7 @@ import (
 	"proy-distri/internal/storage"
 )
 
+// main inicializa analytics y orquesta el procesamiento central de eventos.
 func main() {
 	cfgPath := getenv("CITY_CONFIG", "configs/city.json")
 	cfg, err := config.Load(cfgPath)
@@ -38,6 +39,7 @@ func main() {
 	}
 }
 
+// analyticsApp concentra estado, reglas y sockets de coordinacion.
 type analyticsApp struct {
 	cfg             config.CityConfig
 	evaluator       analyticslogic.Evaluator
@@ -50,6 +52,7 @@ type analyticsApp struct {
 	auxMonitorMutex sync.Mutex  // Protege acceso a auxMonitorCmd
 }
 
+// run configura sockets, workers y bucle principal de consumo desde broker.
 func (a *analyticsApp) run() error {
 	ctx := context.Background()
 
@@ -106,7 +109,7 @@ func (a *analyticsApp) run() error {
 	// Goroutine para verificar periódicamente la salud del DB primario
 	go a.healthCheckLoop(ctx)
 
-	go a.handleRequests(rep, pushLights, pushPrimary, pushReplica)
+	go a.handleRequests(rep, pushLights)
 
 	// Goroutine para recibir y persistir comandos ejecutados desde traffic-light
 	go a.handleExecutedLightCommands(pullExecutedLights, pushPrimary, pushReplica)
@@ -313,8 +316,14 @@ func (a *analyticsApp) handleExecutedLightCommands(pullExecuted, pushPrimary, pu
 
 		/* AQUÍ DEBERÍA CAMBIAR EL OBJETO DE CIUDAD PARA REFLEJAR EL CAMBIO DE ESTADO */
 		a.mu.Lock()
+		
 		a.city.SetLight(cmd.Intersection, cmd.TargetState)
+		current, currentExists := a.city.Get(cmd.Intersection)
+		calculatedStatus := a.calculateStatus(current, cmd.Reason)
+		a.city.SetStatus(cmd.Intersection, calculatedStatus)
+
 		a.mu.Unlock()
+
 
 		// Persistir comando ejecutado
 		data, _ := json.Marshal(cmd)
@@ -328,12 +337,41 @@ func (a *analyticsApp) handleExecutedLightCommands(pullExecuted, pushPrimary, pu
 
 		snpshot := &model.IntersectionSnapshot{
 			Intersection: cmd.Intersection,
-			LightState:  cmd.TargetState,
-			UpdatedAt:   *cmd.ChangedAt,
+			LightState:   cmd.TargetState,
+			UpdatedAt:    *cmd.ChangedAt,
+			Status:       calculatedStatus,
+		}
+		if currentExists && current != nil {
+			snpshot.QueueLength = current.QueueLength
+			snpshot.AvgSpeed = current.AvgSpeed
+			snpshot.Density = current.Density
+			snpshot.VehiclesCounted = current.VehiclesCount
+			snpshot.HasSemaphore = current.HasSemaphore
+			snpshot.Status = calculatedStatus
 		}
 		env.Snapshot = snpshot
 		a.persistEnvelope(env, pushPrimary, pushReplica)
-		a.persistSnapshot(*snpshot, "solved.state", data, pushPrimary, pushReplica)
+		a.persistSnapshot(*snpshot, "light.change", data, pushPrimary, pushReplica)
+	}
+}
+
+func (a *analyticsApp) calculateStatus(current *model.IntersectionState, reason string) string {
+	previous := current.Status
+	
+	switch strings.ToLower(strings.TrimSpace(reason)) {
+	case "deteccion_congestion":
+		if previous == "NORMAL" {
+			return "NORMAL"
+		}
+		return "SOLVED"
+	case "force_green":
+		return "PRIORITY"
+	case "ola_verde":
+		return "PRIORITY"
+	case "cycle_end":
+		return "NORMAL"
+	default:
+		return "NORMAL"
 	}
 }
 
@@ -344,6 +382,7 @@ func (a *analyticsApp) IsPC3Healthy() bool {
 	return a.isPc3Healthy
 }
 
+// processSensor aplica un evento de sensor sobre el modelo y decide acciones.
 func (a *analyticsApp) processSensor(topic string, payload []byte, pushLights, pushPrimary, pushReplica zmq4.Socket) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -362,7 +401,7 @@ func (a *analyticsApp) processSensor(topic string, payload []byte, pushLights, p
 	case model.TopicGPS:
 		var event model.GPSEvent
 		if err = json.Unmarshal(payload, &event); err == nil {
-			snapshot, err = a.city.UpdateFromGPS(event.Interseccion, event.Densidad, event.VelocidadPromedio, event.NivelCongestion)
+			snapshot, err = a.city.UpdateFromGPS(event.Interseccion, event.Densidad, event.VelocidadPromedio)
 		}
 	case model.TopicInductive:
 		var event model.InductiveEvent
@@ -391,8 +430,11 @@ func (a *analyticsApp) processSensor(topic string, payload []byte, pushLights, p
 	}
 
 	status, command := a.evaluator.Evaluate(*latest)
-	latest.Status = status
-	a.city.SetStatus(latest.Intersection, status)
+	
+	updated, err := a.city.SetStatus(latest.Intersection, status)
+	if err == nil && updated != nil {
+		latest = updated
+	}
 
 	a.persistSnapshot(*latest, topic, payload, pushPrimary, pushReplica)
 
@@ -403,7 +445,7 @@ func (a *analyticsApp) processSensor(topic string, payload []byte, pushLights, p
 }
 
 /* Función para escuchar solicitudes de monitoreo */
-func (a *analyticsApp) handleRequests(rep, pushLights, pushPrimary, pushReplica zmq4.Socket) {
+func (a *analyticsApp) handleRequests(rep, pushLights zmq4.Socket) {
 	for {
 		msg, err := rep.Recv()
 		if err != nil {
@@ -422,14 +464,14 @@ func (a *analyticsApp) handleRequests(rep, pushLights, pushPrimary, pushReplica 
 			continue
 		}
 
-		response := a.handleRequest(req, pushLights, pushPrimary, pushReplica)
+		response := a.handleRequest(req, pushLights)
 		data, _ := json.Marshal(response)
 		_ = rep.Send(zmq4.NewMsg(data))
 	}
 }
 
 /* Función para ejecutar solicitudes de monitoreo */
-func (a *analyticsApp) handleRequest(req model.MonitorRequest, pushLights, pushPrimary, pushReplica zmq4.Socket) model.MonitorResponse {
+func (a *analyticsApp) handleRequest(req model.MonitorRequest, pushLights zmq4.Socket) model.MonitorResponse {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -477,6 +519,7 @@ func (a *analyticsApp) handleRequest(req model.MonitorRequest, pushLights, pushP
 	}
 }
 
+// sendLightCommand publica comandos hacia traffic-light con serializacion segura.
 func (a *analyticsApp) sendLightCommand(cmd model.LightCommand, pushLights zmq4.Socket) {
 	// Asignar RequestedAt y dejar ChangedAt vacío
 	cmd.RequestedAt = storage.NowStoreTime()
@@ -488,6 +531,7 @@ func (a *analyticsApp) sendLightCommand(cmd model.LightCommand, pushLights zmq4.
 	a.sendMu.Unlock()
 }
 
+// persistSnapshot adapta un snapshot a sobre de persistencia.
 func (a *analyticsApp) persistSnapshot(snapshot model.IntersectionSnapshot, topic string, raw []byte, pushPrimary, pushReplica zmq4.Socket) {
 	env := model.PersistEnvelope{
 		Kind:       "snapshot",
@@ -499,7 +543,12 @@ func (a *analyticsApp) persistSnapshot(snapshot model.IntersectionSnapshot, topi
 	a.persistEnvelope(env, pushPrimary, pushReplica)
 }
 
+// persistEnvelope aplica politica de circuit breaker para persistencia primaria.
 func (a *analyticsApp) persistEnvelope(env model.PersistEnvelope, pushPrimary, pushReplica zmq4.Socket) {
+	if env.EventID == "" {
+		env.EventID = eventID()
+	}
+
 	data, _ := json.Marshal(env)
 	a.sendMu.Lock()
 	defer a.sendMu.Unlock()
@@ -521,10 +570,17 @@ func (a *analyticsApp) persistEnvelope(env model.PersistEnvelope, pushPrimary, p
 	}
 }
 
+// commandID genera IDs de comando ordenables por tiempo.
 func commandID() string {
 	return "cmd-" + storage.NowStoreTime().Format("20060102150405.000000000")
 }
 
+// eventID genera el identificador comun de cada evento persistido.
+func eventID() string {
+	return "evt-" + storage.NowStoreTime().Format("20060102150405.000000000")
+}
+
+// getenv lee una variable de entorno con fallback.
 func getenv(key, fallback string) string {
 	value := os.Getenv(key)
 	if value == "" {

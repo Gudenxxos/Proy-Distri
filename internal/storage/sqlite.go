@@ -11,10 +11,12 @@ import (
 	"proy-distri/internal/model"
 )
 
+// Store encapsula la conexion SQLite y operaciones de persistencia/consulta.
 type Store struct {
 	db *sql.DB
 }
 
+// storeTimeZone define el huso horario de registro para eventos en BD.
 var storeTimeZone = time.FixedZone("UTC-5", -5*60*60)
 
 // NowStoreTime retorna la hora actual en UTC-5
@@ -30,6 +32,7 @@ func parseStoreTime(value string) (time.Time, error) {
 	return time.ParseInLocation(time.RFC3339Nano, value, storeTimeZone)
 }
 
+// Open inicializa una tienda SQLite y asegura el esquema requerido.
 func Open(path string) (*Store, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -44,14 +47,17 @@ func Open(path string) (*Store, error) {
 	return store, nil
 }
 
+// Close cierra la conexion activa a la base de datos.
 func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// initSchema crea las tablas base usadas por analytics y monitor.
 func (s *Store) initSchema() error {
 	schema := `
 CREATE TABLE IF NOT EXISTS traffic_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+	event_id TEXT,
   kind TEXT NOT NULL,
   topic TEXT NOT NULL,
   intersection TEXT,
@@ -80,10 +86,12 @@ CREATE TABLE IF NOT EXISTS light_actions (
 		return err
 	}
 
+	_, _ = s.db.Exec(`ALTER TABLE traffic_events ADD COLUMN event_id TEXT`)
 	_, _ = s.db.Exec(`ALTER TABLE traffic_events ADD COLUMN has_semaphore INTEGER DEFAULT 0`)
 	return nil
 }
 
+// InsertEnvelope persiste snapshots, comandos y metadatos en la BD.
 func (s *Store) InsertEnvelope(env model.PersistEnvelope) error {
 	raw := env.RawPayload
 	intersection := ""
@@ -118,8 +126,9 @@ func (s *Store) InsertEnvelope(env model.PersistEnvelope) error {
 
 	_, err := s.db.Exec(
 		`INSERT INTO traffic_events
-		(kind, topic, intersection, has_semaphore, status, light_state, queue_length, avg_speed, density, raw_payload, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		(event_id, kind, topic, intersection, has_semaphore, status, light_state, queue_length, avg_speed, density, raw_payload, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		env.EventID,
 		env.Kind,
 		env.Topic,
 		intersection,
@@ -164,6 +173,7 @@ func (s *Store) InsertEnvelope(env model.PersistEnvelope) error {
 	return err
 }
 
+// MarkLightChanged marca la hora efectiva de ejecucion de un comando.
 func (s *Store) MarkLightChanged(commandID string, changedAt time.Time) error {
 	_, err := s.db.Exec(
 		`UPDATE light_actions SET changed_at = ? WHERE command_id = ?`,
@@ -173,12 +183,13 @@ func (s *Store) MarkLightChanged(commandID string, changedAt time.Time) error {
 	return err
 }
 
+// QueryCurrent devuelve el ultimo snapshot conocido de una interseccion.
 func (s *Store) QueryCurrent(intersection string) ([]model.IntersectionSnapshot, error) {
 	rows, err := s.db.Query(
 		`SELECT intersection, has_semaphore, queue_length, avg_speed, density, light_state, status, created_at
 		FROM traffic_events
 		WHERE intersection = ?
-		ORDER BY id DESC
+		ORDER BY created_at DESC
 		LIMIT 1`,
 		intersection,
 	)
@@ -211,6 +222,7 @@ func (s *Store) QueryCurrent(intersection string) ([]model.IntersectionSnapshot,
 	return out, rows.Err()
 }
 
+// QueryHistory devuelve eventos en un rango temporal.
 func (s *Store) QueryHistory(from, to time.Time) ([]map[string]any, error) {
 	rows, err := s.db.Query(
 		`SELECT kind, topic, intersection, status, light_state, queue_length, avg_speed, density, created_at
@@ -250,6 +262,7 @@ func (s *Store) QueryHistory(from, to time.Time) ([]map[string]any, error) {
 	return results, rows.Err()
 }
 
+// CountBetween cuenta eventos persistidos dentro de un rango temporal.
 func (s *Store) CountBetween(from, to time.Time) (int, error) {
 	row := s.db.QueryRow(
 		`SELECT COUNT(*) FROM traffic_events WHERE created_at BETWEEN ? AND ?`,
@@ -265,6 +278,7 @@ func (s *Store) CountBetween(from, to time.Time) (int, error) {
 	return count, nil
 }
 
+// String devuelve una representacion corta de la instancia de Store.
 func (s *Store) String() string {
 	return fmt.Sprintf("store<%p>", s)
 }

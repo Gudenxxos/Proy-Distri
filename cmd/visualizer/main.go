@@ -17,6 +17,7 @@ import (
 	"proy-distri/internal/web"
 )
 
+// main inicia el visualizador HTTP y los consumidores de eventos.
 func main() {
 	cfgPath := getenv("CITY_CONFIG", "configs/city.json")
 	cfg, err := config.Load(cfgPath)
@@ -36,6 +37,7 @@ func main() {
 	log.Fatal(http.ListenAndServe(cfg.Endpoints.VisualizerHTTP, nil))
 }
 
+// visualizer mantiene estado de intersecciones y suscriptores SSE.
 type visualizer struct {
 	cfg   config.CityConfig
 	mu    sync.RWMutex
@@ -43,6 +45,7 @@ type visualizer struct {
 	subs  map[chan []byte]struct{}
 }
 
+// newVisualizer construye el estado inicial para la UI.
 func newVisualizer(cfg config.CityConfig) *visualizer {
 	state := make(map[string]model.IntersectionSnapshot, len(cfg.Intersections))
 	for _, item := range cfg.Intersections {
@@ -65,6 +68,7 @@ func newVisualizer(cfg config.CityConfig) *visualizer {
 	}
 }
 
+// hasSensor verifica si una interseccion tiene al menos un sensor asociado.
 func (v *visualizer) hasSensor(intersection string) bool {
 	intersection = strings.ToUpper(strings.TrimSpace(intersection))
 	for _, sp := range v.cfg.SensorProfiles {
@@ -75,6 +79,22 @@ func (v *visualizer) hasSensor(intersection string) bool {
 	return false
 }
 
+// hasSpeedSensor verifica si la interseccion puede reportar velocidad real.
+func (v *visualizer) hasSpeedSensor(intersection string) bool {
+	intersection = strings.ToUpper(strings.TrimSpace(intersection))
+	for _, sp := range v.cfg.SensorProfiles {
+		if strings.ToUpper(strings.TrimSpace(sp.Intersection)) != intersection {
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(sp.SensorType)) {
+		case "camara", "gps":
+			return true
+		}
+	}
+	return false
+}
+
+// consumeBroker procesa eventos de sensores y actualiza snapshots.
 func (v *visualizer) consumeBroker() {
 	sub := zmq4.NewSub(context.Background())
 	defer sub.Close()
@@ -137,19 +157,40 @@ func (v *visualizer) consumeBroker() {
 		}
 		if updated != nil {
 			item := v.state[updated.Intersection]
-			item.Status = v.statusCalculatedFromData(item)
+			previousStatus := item.Status
+			item.Status = v.resolveStatus(previousStatus, v.statusCalculatedFromData(item))
 			v.state[updated.Intersection] = item
+			updated = &item
 			v.broadcastSnapshot(*updated, topic)
 		}
 		v.mu.Unlock()
 	}
 }
 
+// statusCalculatedFromData deriva un estado visual desde metricas de trafico.
 func (v *visualizer) statusCalculatedFromData(item model.IntersectionSnapshot) string {
-	if item.QueueLength >= 8 || item.AvgSpeed < 20 || item.Density >= 35 {
+	hasSpeed := v.hasSpeedSensor(item.Intersection)
+	if item.QueueLength >= 8 || item.Density >= 35 {
+		return "CONGESTION"
+	}
+	if hasSpeed && item.AvgSpeed > 0 && item.AvgSpeed < 20 {
 		return "CONGESTION"
 	}
 	return "NORMAL"
+}
+
+// resolveStatus conserva el contexto de prioridad cuando la data ya indica congestion.
+func (v *visualizer) resolveStatus(previousStatus, calculatedStatus string) string {
+	previousStatus = strings.ToUpper(strings.TrimSpace(previousStatus))
+	calculatedStatus = strings.ToUpper(strings.TrimSpace(calculatedStatus))
+
+	if calculatedStatus == "CONGESTION" && (previousStatus == "PRIORITY" || previousStatus == "CONGESTION_BUT_PRIORITY") {
+		return "CONGESTION_BUT_PRIORITY"
+	} else if calculatedStatus == "NORMAL" && (previousStatus == "CONGESTION_BUT_PRIORITY" || previousStatus == "PRIORITY") {
+		return "PRIORITY"
+	}
+
+	return calculatedStatus
 }
 
 // consumeLightCommands recibe LightCommand desde analytics para actualizar semáforos
@@ -191,6 +232,7 @@ func (v *visualizer) consumeLightCommands() {
 	}
 }
 
+// broadcastSnapshot publica una actualizacion a clientes SSE activos.
 func (v *visualizer) broadcastSnapshot(snapshot model.IntersectionSnapshot, topic string) {
 	envelope := map[string]any{
 		"topic":    topic,
@@ -205,29 +247,32 @@ func (v *visualizer) broadcastSnapshot(snapshot model.IntersectionSnapshot, topi
 	}
 }
 
+// statusFromReason traduce razones de comando a estado de UI.
 func (v *visualizer) statusFromReason(previous, reason string) string {
 	switch strings.ToLower(strings.TrimSpace(reason)) {
 	case "deteccion_congestion":
+		if previous == "NORMAL" {
+			return "NORMAL"
+		}
 		return "SOLVED"
 	case "force_green":
 		return "PRIORITY"
 	case "ola_verde":
 		return "PRIORITY"
 	case "cycle_end":
-		if strings.TrimSpace(previous) != "" {
-			return previous
-		}
 		return "NORMAL"
 	default:
 		return "NORMAL"
 	}
 }
 
+// handleIndex sirve la pagina principal del visualizador.
 func (v *visualizer) handleIndex(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write([]byte(web.IndexHTML))
 }
 
+// handleState devuelve el estado actual de todas las intersecciones.
 func (v *visualizer) handleState(w http.ResponseWriter, _ *http.Request) {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
@@ -244,6 +289,7 @@ func (v *visualizer) handleState(w http.ResponseWriter, _ *http.Request) {
 	_ = json.NewEncoder(w).Encode(list)
 }
 
+// handleEvents mantiene un stream SSE para actualizaciones en tiempo real.
 func (v *visualizer) handleEvents(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -278,6 +324,7 @@ func (v *visualizer) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// broadcast envia un evento generico a los suscriptores SSE.
 func (v *visualizer) broadcast(payload []byte, topic string) {
 	envelope := map[string]any{"topic": topic}
 
@@ -290,6 +337,7 @@ func (v *visualizer) broadcast(payload []byte, topic string) {
 	}
 }
 
+// getenv lee una variable de entorno con fallback.
 func getenv(key, fallback string) string {
 	value := os.Getenv(key)
 	if value == "" {
